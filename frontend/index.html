@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pronunciation Mirror (Prototype)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 24px; background: #0b0e12; color: #ecf1f7; }
+    h1 { margin: 0 0 12px; font-size: 20px; }
+    .row { display: flex; flex-wrap: wrap; gap: 16px; }
+    .col { flex: 1 1 360px; min-width: 320px; background: #131821; border: 1px solid #1e2530; border-radius: 12px; padding: 16px; }
+    .controls label { display:block; font-size: 14px; margin-bottom: 6px; opacity: 0.9; }
+    .controls input[type="file"] { width: 100%; }
+    button { background: #2a72ff; border: none; color: white; padding: 10px 14px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+    button.secondary { background: #22314a; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .pill { display:inline-block; padding:6px 10px; background:#192131; border:1px solid #243048; border-radius:999px; font-size:12px; margin-right:6px; }
+    .score { font-size: 28px; font-weight: 700; }
+    .hint { font-size: 12px; opacity: 0.8; }
+    canvas { width: 100%; height: 160px; background: #0e141d; border: 1px solid #1f2836; border-radius: 8px; display:block; }
+    .stack { display:grid; grid-template-columns: 1fr; gap: 8px; }
+    .badge { display:inline-block; background:#1d2636; border:1px solid #2a3850; padding:4px 8px; border-radius:6px; margin-right:6px; font-size:12px; }
+    .legend { font-size:12px; opacity:0.85; }
+    .legend span { margin-right:10px; }
+    .legend .ref::before { content:'■'; margin-right:4px; color:#9aa7ff; }
+    .legend .user::before { content:'■'; margin-right:4px; color:#4be38e; }
+    .legend .mismatch::before { content:'■'; margin-right:4px; color:#ff6b6b; }
+  </style>
+</head>
+<body>
+  <h1>Pronunciation Mirror (Prototype)</h1>
+  <p class="hint">Load a reference audio (MP3/WAV), toggle Live compare (beta) if you want near-realtime feedback, then speak into the mic. You’ll see overlays for waveform/envelope, spectrogram (reference ghost), and pitch, plus a running similarity score. Optionally use MFA alignment for word/phoneme guides.</p>
+
+  <div class="row">
+    <div class="col">
+      <h3>1) Reference</h3>
+      <div class="controls">
+        <label>Reference audio (MP3/WAV)</label>
+        <input id="refFile" type="file" accept="audio/*" />
+        <div style="margin-top:8px;">
+          <button id="playRefBtn" class="secondary" disabled>Play / Pause Ref</button>
+          <span id="refStatus" class="pill">No file</span>
+        </div>
+        <div style="margin-top:8px;">
+          <label>Optional transcript (for MFA):</label>
+          <textarea id="transcript" rows="4" style="width:100%;"></textarea>
+          <div style="margin-top:8px;">
+            <button id="alignBtn" class="secondary" disabled>Align (MFA)</button>
+            <span id="alignStatus" class="pill">Idle</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:16px;" class="stack">
+        <div class="legend"><span class="ref">Reference</span><span class="user">Your voice</span><span class="mismatch">Mismatch</span></div>
+        <canvas id="waveform"></canvas>
+        <canvas id="spectrogram"></canvas>
+        <canvas id="pitch"></canvas>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>2) Your Attempt</h3>
+      <div class="controls">
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button id="startBtn">Start Mic</button>
+          <button id="stopBtn" class="secondary" disabled>Stop</button>
+          <span id="micStatus" class="pill">Mic off</span>
+        </div>
+        <label style="display:flex;align-items:center;gap:6px;margin-top:8px;">
+          <input id="liveChk" type="checkbox"/> Live compare (beta) <span class="hint">(~250ms updates)</span>
+        </label>
+        <div style="margin-top:10px;">
+          <label>Upload your recording (optional, instead of mic):</label>
+          <input id="userFile" type="file" accept="audio/*" />
+        </div>
+        <div style="margin-top:10px;">
+          <button id="compareBtn" class="secondary" disabled>Compare & Score</button>
+          <span id="compareStatus" class="pill">Idle</span>
+        </div>
+      </div>
+      <div style="margin-top:16px;">
+        <div>Similarity score (pitch + envelope):</div>
+        <div class="score"><span id="scoreValue">—</span> / 100</div>
+        <div id="tips" class="hint" style="margin-top:10px;"></div>
+      </div>
+      <div style="margin-top:16px;">
+        <div class="badge">DTW banded</div>
+        <div class="badge">Autocorr pitch</div>
+        <div class="badge">FFT spectrogram</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function rms(buf) { let s=0; for(let i=0;i<buf.length;i++) s+=buf[i]*buf[i]; return Math.sqrt(s/buf.length); }
+    function normalize(arr) { const max = Math.max(...arr.map(v => Math.abs(v)||0.000001)); return arr.map(v => v/(max||1)); }
+    function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+    function dtwDistance(a, b, band= Math.max(10, Math.floor(Math.max(a.length,b.length)*0.08))) {
+      const n=a.length, m=b.length, INF=1e12; const D=Array(n+1); for(let i=0;i<=n;i++){D[i]=new Float64Array(m+1); for(let j=0;j<=m;j++) D[i][j]=INF;} D[0][0]=0;
+      for (let i=1;i<=n;i++){ const jStart=Math.max(1,i-band), jEnd=Math.min(m,i+band); for(let j=jStart;j<=jEnd;j++){ const cost=Math.abs(a[i-1]-b[j-1]); D[i][j]=cost+Math.min(D[i-1][j],D[i][j-1],D[i-1][j-1]); } } return D[n][m]/(n+m);
+    }
+    function pitchTrack(frame, sampleRate, fmin=60, fmax=500) {
+      const buf=frame.slice(); let avg=0; for(let i=0;i<buf.length;i++) avg+=Math.abs(buf[i]); avg/=buf.length; const clip=0.6*avg; for(let i=0;i<buf.length;i++) buf[i]=Math.abs(buf[i])>=clip?buf[i]:0;
+      const size=buf.length, ac=new Float32Array(size); for(let lag=0; lag<size; lag++){ let sum=0; for(let i=0;i<size-lag;i++) sum+=buf[i]*buf[i+lag]; ac[lag]=sum; }
+      const minLag=Math.floor(sampleRate/fmax), maxLag=Math.floor(sampleRate/fmin); let bestLag=-1, bestVal=-1;
+      for(let lag=minLag; lag<=Math.min(maxLag,size-1); lag++){ if(ac[lag]>bestVal){ bestVal=ac[lag]; bestLag=lag; } }
+      if(bestLag<=0) return 0; return sampleRate/bestLag;
+    }
+    async function decodeFileToBuffer(file, audioCtx){ const arrBuf=await file.arrayBuffer(); return await audioCtx.decodeAudioData(arrBuf); }
+    function clearCanvas(ctx){ ctx.fillStyle="#0e141d"; ctx.fillRect(0,0,ctx.canvas.width,ctx.canvas.height); }
+    function drawWave(ctx,data,color="#9aa7ff"){ clearCanvas(ctx); ctx.strokeStyle=color; ctx.lineWidth=1.5; ctx.beginPath(); const W=ctx.canvas.width,H=ctx.canvas.height;
+      for(let i=0;i<data.length;i++){ const x=i/(data.length-1)*W; const y=(0.5-data[i]*0.45)*H; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);} ctx.stroke(); }
+    function overlayWave(ctx,baseData,overData){ drawWave(ctx,baseData,"#9aa7ff"); ctx.strokeStyle="#4be38e"; ctx.lineWidth=1.2; ctx.beginPath(); const W=ctx.canvas.width,H=ctx.canvas.height;
+      for(let i=0;i<overData.length;i++){ const x=i/(overData.length-1)*W; const y=(0.5-overData[i]*0.45)*H; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);} ctx.stroke(); }
+    function drawPitch(ctx,refHz,userHz){ clearCanvas(ctx); const W=ctx.canvas.width,H=ctx.canvas.height; function mapY(hz){ const lo=60,hi=500; const v=(Math.log2(clamp(hz,lo,hi))-Math.log2(lo))/(Math.log2(hi)-Math.log2(lo)); return (1-v)*H; }
+      ctx.strokeStyle="#9aa7ff"; ctx.beginPath(); for(let i=0;i<refHz.length;i++){ const x=i/(refHz.length-1)*W, y=mapY(refHz[i]||60); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);} ctx.stroke();
+      ctx.strokeStyle="#4be38e"; ctx.beginPath(); for(let i=0;i<userHz.length;i++){ const x=i/(userHz.length-1)*W, y=mapY(userHz[i]||60); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);} ctx.stroke(); }
+    function drawSpectrogram(ctx, spec2d, maxDb=80){ const W=ctx.canvas.width,H=ctx.canvas.height, rows=spec2d.length, cols=spec2d[0]?.length||0; const image=ctx.createImageData(W,H);
+      for(let x=0;x<W;x++){ const tIdx=Math.floor(x/W*rows); for(let y=0;y<H;y++){ const fIdx=Math.floor((1-y/H)*cols); const v=spec2d[tIdx]?.[fIdx] ?? -120; const norm=clamp((v+maxDb)/maxDb,0,1); const i=(y*W+x)*4;
+        image.data[i+0]=40+Math.floor(180*norm); image.data[i+1]=40+Math.floor(60*norm); image.data[i+2]=80+Math.floor(200*norm); image.data[i+3]=255; } } ctx.putImageData(image,0,0); }
+    function stft(buffer,sampleRate,frameSize=1024,hop=256){ const ch=buffer.getChannelData(0); const frames=[]; const window=new Float32Array(frameSize); for(let i=0;i<frameSize;i++) window[i]=0.5*(1-Math.cos(2*Math.PI*i/(frameSize-1)));
+      for(let start=0; start+frameSize<=ch.length; start+=hop){ const frame=new Float32Array(frameSize); for(let i=0;i<frameSize;i++) frame[i]=ch[start+i]*window[i];
+        const N=frameSize, mags=new Float32Array(N/2); for(let k=0;k<N/2;k++){ let re=0, im=0; for(let n=0;n<N;n++){ const ang=-2*Math.PI*k*n/N; re+=frame[n]*Math.cos(ang); im+=frame[n]*Math.sin(ang);} const mag=Math.sqrt(re*re+im*im); mags[k]=20*Math.log10(mag+1e-6);} frames.push(mags);} return frames; }
+    function envelopeTrack(buffer,sampleRate,winMs=20,hopMs=10){ const ch=buffer.getChannelData(0), win=Math.floor(sampleRate*winMs/1000), hop=Math.floor(sampleRate*hopMs/1000), env=[];
+      for(let start=0; start+win<=ch.length; start+=hop){ const frame=ch.slice(start,start+win); env.push(rms(frame)); } return normalize(env); }
+    function pitchContour(buffer,sampleRate,winMs=40,hopMs=10){ const ch=buffer.getChannelData(0), win=Math.floor(sampleRate*winMs/1000), hop=Math.floor(sampleRate*hopMs/1000), out=[];
+      for(let start=0; start+win<=ch.length; start+=hop){ const frame=ch.slice(start,start+win); out.push(pitchTrack(frame,sampleRate)); } return out.map(v=> (isFinite(v)&&v>0)? v: 0); }
+
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let refBuffer=null, refEnv=[], refPitch=[], refSpec=[]; let refSourceNode=null, refPlaying=false;
+    let micStream=null, micSource=null, micProcessor=null; let userRecBuffer=null, userEnv=[], userPitch=[]; let collecting=false; let userChunks=[];
+
+    const refFile=document.getElementById('refFile'), userFile=document.getElementById('userFile'), playRefBtn=document.getElementById('playRefBtn'),
+          refStatus=document.getElementById('refStatus'), alignBtn=document.getElementById('alignBtn'), alignStatus=document.getElementById('alignStatus'),
+          transcriptEl=document.getElementById('transcript'), startBtn=document.getElementById('startBtn'), stopBtn=document.getElementById('stopBtn'),
+          micStatus=document.getElementById('micStatus'), compareBtn=document.getElementById('compareBtn'), compareStatus=document.getElementById('compareStatus'),
+          scoreValue=document.getElementById('scoreValue'), tips=document.getElementById('tips');
+    const liveChk = document.getElementById('liveChk');
+    const waveCanvas=document.getElementById('waveform'), specCanvas=document.getElementById('spectrogram'), pitchCanvas=document.getElementById('pitch');
+    const waveCtx=waveCanvas.getContext('2d'), specCtx=specCanvas.getContext('2d'), pitchCtx=pitchCanvas.getContext('2d');
+
+    let liveCounter = 0;
+    let refWindowSamples = null;
+    function updateRefWindowSamples(){ if(refBuffer) refWindowSamples = Math.max(1, Math.floor(refBuffer.duration * audioCtx.sampleRate * 1.15)); }
+
+    function resizeCanvases(){ [waveCanvas,specCanvas,pitchCanvas].forEach(c=>{ const rect=c.getBoundingClientRect(); c.width=Math.floor(rect.width*devicePixelRatio); c.height=Math.floor(160*devicePixelRatio); });
+      if(refBuffer && userRecBuffer){ drawAll(); } else if(refBuffer){ const env=refEnv.length?refEnv:[0]; drawWave(waveCtx, env, "#9aa7ff"); drawSpectrogram(specCtx, refSpec.length?refSpec:[[-80]], 80); drawPitch(pitchCtx, refPitch, []); } else { clearCanvas(waveCtx); clearCanvas(specCtx); clearCanvas(pitchCtx); } }
+    window.addEventListener('resize', resizeCanvases); resizeCanvases();
+
+    function drawAll(){ if(!refEnv.length || !userEnv.length) return;
+      const L=Math.max(refEnv.length, userEnv.length);
+      function resample(arr,L){ const out=new Float32Array(L); for(let i=0;i<L;i++){ const pos=i*(arr.length-1)/(L-1); const lo=Math.floor(pos), hi=Math.min(arr.length-1,lo+1), t=pos-lo; out[i]=(1-t)*arr[lo]+t*arr[hi]; } return out; }
+      const envRef=resample(refEnv,L), envUser=resample(userEnv,L); overlayWave(waveCtx, envRef, envUser);
+      drawSpectrogram(specCtx, refSpec, 80);
+      const pRef=resample(refPitch,L), pUser=resample(userPitch,L); drawPitch(pitchCtx, pRef, pUser);
+    }
+
+    refFile.addEventListener('change', async (e)=>{ const file=e.target.files[0]; if(!file) return; refStatus.textContent="Loading...";
+      try{ refBuffer=await decodeFileToBuffer(file,audioCtx); refEnv=Array.from(envelopeTrack(refBuffer,audioCtx.sampleRate)); refPitch=Array.from(pitchContour(refBuffer,audioCtx.sampleRate)); refSpec=stft(refBuffer,audioCtx.sampleRate,1024,256);
+        refStatus.textContent="Reference ready"; playRefBtn.disabled=false; compareBtn.disabled=false; alignBtn.disabled=false; updateRefWindowSamples(); drawAll(); } catch(err){ console.error(err); refStatus.textContent="Failed to load"; } });
+
+    playRefBtn.addEventListener('click', ()=>{ if(!refBuffer) return; if(!refPlaying){ refSourceNode=audioCtx.createBufferSource(); refSourceNode.buffer=refBuffer; refSourceNode.connect(audioCtx.destination);
+        refSourceNode.onended=()=>{ refPlaying=false; playRefBtn.textContent="Play Ref"; }; refSourceNode.start(); refPlaying=true; playRefBtn.textContent="Pause (stop)"; }
+      else{ try{ refSourceNode.stop(); }catch(e){} refPlaying=false; playRefBtn.textContent="Play Ref"; } });
+
+    startBtn.addEventListener('click', async ()=>{ try{ micStream=await navigator.mediaDevices.getUserMedia({audio:true}); micSource=audioCtx.createMediaStreamSource(micStream);
+        const bufferSize=2048; micProcessor=audioCtx.createScriptProcessor(bufferSize,1,1); micSource.connect(micProcessor); micProcessor.connect(audioCtx.destination);
+        collecting=true; userChunks=[]; liveCounter=0; micStatus.textContent="Recording..."; micProcessor.onaudioprocess=(e)=>{ const input=e.inputBuffer.getChannelData(0); userChunks.push(new Float32Array(input));
+          if (liveChk && liveChk.checked && refBuffer) { liveCounter = (liveCounter + 1) % 12; if (liveCounter % 3 === 0) {
+              const totalLen = userChunks.reduce((a,c)=>a+c.length,0); if (!refWindowSamples) updateRefWindowSamples(); const need = Math.min(totalLen, refWindowSamples || totalLen);
+              const merged = new Float32Array(totalLen); let off = 0; for (const c of userChunks){ merged.set(c, off); off += c.length; }
+              const start = Math.max(0, merged.length - need); const slice = merged.subarray(start);
+              const buf = audioCtx.createBuffer(1, slice.length, audioCtx.sampleRate); buf.copyToChannel(slice, 0);
+              userRecBuffer = buf; userEnv = Array.from(envelopeTrack(buf, audioCtx.sampleRate)); userPitch = Array.from(pitchContour(buf, audioCtx.sampleRate));
+              if (refEnv.length && userEnv.length) {
+                function resample(arr,L){ const out=new Float32Array(L); for (let i=0;i<L;i++){ const pos=i*(arr.length-1)/(L-1); const lo=Math.floor(pos), hi=Math.min(arr.length-1, lo+1); const t=pos-lo; out[i]=(1-t)*arr[lo]+t*arr[hi]; } return out; }
+                const L = Math.max(refEnv.length, userEnv.length);
+                const a = resample(refEnv, L), b = resample(userEnv, L);
+                const pitA = resample(refPitch.map(v=> v>0? Math.log2(v): 0), L);
+                const pitB = resample(userPitch.map(v=> v>0? Math.log2(v): 0), L);
+                const dEnv = dtwDistance(a, b), dPit = dtwDistance(pitA, pitB);
+                const sEnv = Math.max(0, Math.min(100, 100*Math.exp(-3*dEnv)));
+                const sPit = Math.max(0, Math.min(100, 100*Math.exp(-3*dPit)));
+                const score = Math.round(0.4*sEnv + 0.6*sPit);
+                scoreValue.textContent = score.toString();
+                let msg=[]; if(sPit<65) msg.push("Match the melody."); if(sEnv<65) msg.push("Match rhythm & stress."); document.getElementById('tips').textContent = msg.join(" ");
+                drawAll();
+              }
+          } } };
+        document.getElementById('stopBtn').disabled=false; document.getElementById('startBtn').disabled=true; document.getElementById('compareBtn').disabled=false; } catch(err){ console.error(err); micStatus.textContent="Mic error"; } });
+
+    stopBtn.addEventListener('click', async ()=>{ if(!collecting) return; collecting=false; if(micProcessor) micProcessor.disconnect(); if(micSource) micSource.disconnect(); if(micStream) micStream.getTracks().forEach(t=>t.stop());
+      micStatus.textContent="Processing..."; const totalLen=userChunks.reduce((a,c)=>a+c.length,0); const merged=new Float32Array(totalLen); let off=0; for(const c of userChunks){ merged.set(c,off); off+=c.length; }
+      userRecBuffer=audioCtx.createBuffer(1, merged.length, audioCtx.sampleRate); userRecBuffer.copyToChannel(merged,0); userEnv=Array.from(envelopeTrack(userRecBuffer,audioCtx.sampleRate)); userPitch=Array.from(pitchContour(userRecBuffer,audioCtx.sampleRate));
+      micStatus.textContent="Ready"; document.getElementById('stopBtn').disabled=true; document.getElementById('startBtn').disabled=false; drawAll(); });
+
+    userFile.addEventListener('change', async (e)=>{ const file=e.target.files[0]; if(!file) return; compareStatus.textContent="Loading...";
+      try{ userRecBuffer=await decodeFileToBuffer(file,audioCtx); userEnv=Array.from(envelopeTrack(userRecBuffer,audioCtx.sampleRate)); userPitch=Array.from(pitchContour(userRecBuffer,audioCtx.sampleRate));
+        compareStatus.textContent="User audio ready"; drawAll(); } catch(err){ console.error(err); compareStatus.textContent="Failed to load"; } });
+
+    compareBtn.addEventListener('click', ()=>{ if(!refEnv.length || !userEnv.length){ compareStatus.textContent="Need ref + user audio"; return; } compareStatus.textContent="Scoring...";
+      function resample(arr,L){ const out=new Float32Array(L); for(let i=0;i<L;i++){ const pos=i*(arr.length-1)/(L-1); const lo=Math.floor(pos), hi=Math.min(arr.length-1,lo+1), t=pos-lo; out[i]=(1-t)*arr[lo]+t*arr[hi]; } return out; }
+      const L = Math.max(refEnv.length, userEnv.length);
+      const envA=resample(refEnv,L), envB=resample(userEnv,L);
+      const pitA=resample(refPitch.map(v=> v>0? Math.log2(v): 0), L), pitB=resample(userPitch.map(v=> v>0? Math.log2(v): 0), L);
+      const dEnv=dtwDistance(envA, envB), dPit=dtwDistance(pitA, pitB); const sEnv=Math.max(0, Math.min(100, 100*Math.exp(-3*dEnv))), sPit=Math.max(0, Math.min(100, 100*Math.exp(-3*dPit)));
+      const score=Math.round(0.4*sEnv + 0.6*sPit); scoreValue.textContent=score.toString(); compareStatus.textContent="Done";
+      let msg=[]; if(sPit<65) msg.push("Match the melody: exaggerate intonation."); if(sEnv<65) msg.push("Match rhythm & stress."); if(!msg.length) msg.push("Nice! Try a faster sample.");
+      document.getElementById('tips').textContent=msg.join(" "); drawAll(); });
+
+    document.getElementById('alignBtn').addEventListener('click', async ()=>{
+      if(!refBuffer){ alignStatus.textContent="Load reference first"; return; }
+      const txt=document.getElementById('transcript').value.trim(); if(!txt){ alignStatus.textContent="Need transcript"; return; }
+      alignStatus.textContent="Preparing audio...";
+      function bufferToWav(audioBuffer){ const numCh=audioBuffer.numberOfChannels, len=audioBuffer.length*numCh*2+44; const buf=new ArrayBuffer(len), view=new DataView(buf); let pos=0;
+        function set16(d){ view.setUint16(pos,d,true); pos+=2;} function set32(d){ view.setUint32(pos,d,true); pos+=4;}
+        set32(0x46464952); set32(len-8); set32(0x45564157); set32(0x20746d66); set32(16); set16(1); set16(numCh); set32(audioBuffer.sampleRate); set32(audioBuffer.sampleRate*numCh*2); set16(numCh*2); set16(16); set32(0x61746164); set32(len-pos-4);
+        const channels=[]; for(let i=0;i<numCh;i++) channels.push(audioBuffer.getChannelData(i)); let offset=0; while(pos<len){ for(let i=0;i<numCh;i++){ let s=Math.max(-1,Math.min(1, channels[i][offset])); view.setInt16(pos, s<0 ? s*0x8000 : s*0x7FFF, true); pos+=2; } offset++; } return new Blob([view],{type:"audio/wav"}); }
+      try{
+        const wav=bufferToWav(refBuffer); const form=new FormData(); form.append("audio", wav, "reference.wav"); form.append("transcript", txt);
+        alignStatus.textContent="Calling backend..."; const res=await fetch("http://localhost:8000/align",{method:"POST", body: form}); if(!res.ok) throw new Error("Backend error"); const data=await res.json();
+        alignStatus.textContent=`Aligned: ${(data.words&&data.words.length)||0} words, ${(data.phones&&data.phones.length)||0} phones`;
+        if(data.words && data.words.length && refEnv.length){ const ctx=waveCtx; const W=ctx.canvas.width, H=ctx.canvas.height; drawAll(); ctx.strokeStyle="#ffcc66"; ctx.lineWidth=1; ctx.beginPath();
+          for(const w of data.words){ const t=w.start/(refBuffer.duration||1); const x=t*W; ctx.moveTo(x,0); ctx.lineTo(x,H); } ctx.stroke(); }
+      }catch(e){ console.error(e); alignStatus.textContent="Failed (is backend running?)"; }
+    });
+  </script>
+</body>
+</html>
