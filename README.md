@@ -21,3 +21,8 @@ mfa model download acoustic swedish_mfa
 mfa model download dictionary swedish_mfa
 uvicorn backend.server:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+Next improvements: 
+Labels for each word/phoneme (the code currently only draws the boundary lines, not the text).
+Alignment for your own attempt — right now it only aligns the reference audio to its transcript.
+Constant reply of source audio enabling user to match (and enabling overlapping waves).
